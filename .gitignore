@@ -1,7 +1,43 @@
+# Build output
 target/
 *.class
 *.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Maven
+dependency-reduced-pom.xml
+release.properties
+.flattened-pom.xml
+
+# Logs
+*.log
+hs_err_pid*
+replay_pid*
+
+# IDE - IntelliJ
 .idea/
 *.iml
+*.ipr
+*.iws
+
+# IDE - Eclipse
+.classpath
+.project
+.settings/
+.factorypath
+
+# IDE - VS Code
 .vscode/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Editor swap/backup files
+*~
+*.swp
+*.swo
+
+# Local environment / secrets
+.env
+.env.*
