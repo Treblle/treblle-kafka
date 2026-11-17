@@ -1,4 +1,4 @@
-package com.treblle.kafka.core;
+package com.treblle.kafka.internal.core;
 
 import java.net.InetAddress;
 import java.time.Instant;

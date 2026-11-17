@@ -1,7 +1,10 @@
 package com.treblle.kafka;
 
-import com.treblle.kafka.core.Capture;
+import com.treblle.kafka.internal.core.BodyNormalizer;
+import com.treblle.kafka.internal.core.Capture;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -18,6 +21,7 @@ import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.metrics.KafkaMetric;
 
 /**
  * A {@link Producer} that reports everything it sends to Treblle.
@@ -34,8 +38,14 @@ import org.apache.kafka.common.Uuid;
  * Treblle without a schema registry.
  *
  * <p>Correlating a send with its broker acknowledgement is exact here, because the decorator owns
- * the callback. It also works on every {@code kafka-clients} version, which a
- * {@code ProducerInterceptor} does not.
+ * the callback.
+ *
+ * <p>The {@code Producer} interface differs between {@code kafka-clients} versions: 3.x has
+ * {@code sendOffsetsToTransaction(Map, String)}, 3.7+ adds {@code clientInstanceId}, and 4.x
+ * drops the former and adds {@code registerMetricForSubscription}/
+ * {@code unregisterMetricFromSubscription}. This class declares the union, without
+ * {@code @Override}, and delegates the version-specific ones reflectively - so the same jar
+ * compiles and runs against every 3.x and 4.x client.
  */
 final class TreblleProducer<K, V> implements Producer<K, V> {
 
@@ -99,23 +109,32 @@ final class TreblleProducer<K, V> implements Producer<K, V> {
     private Capture capture(ProducerRecord<K, V> record) {
         try {
             if (record == null || !treblle.isTracking(record.topic())) {
+                // Still consume the thread's metadata, so it cannot attach itself to a later,
+                // unrelated message.
+                TreblleContext.forSend();
                 return null;
             }
             Capture capture = new Capture();
             capture.operation = Capture.OPERATION_PRODUCE;
             capture.topic = record.topic();
-            capture.key = ClientInfo.renderKey(record.key());
-            capture.value = record.value();
+            capture.key = treblle.getConfig().isCaptureRecordKeys()
+                    ? ClientInfo.renderKey(record.key())
+                    : null;
+            Map<String, Object> oversized = BodyNormalizer.oversizedPlaceholder(record.value());
+            capture.value = oversized != null ? oversized : record.value();
+            capture.estimatedBytes = BodyNormalizer.estimateBytes(capture.value);
             capture.headers = ClientInfo.flattenHeaders(record.headers());
-            capture.recordTimestampMillis =
-                    record.timestamp() != null ? record.timestamp() : System.currentTimeMillis();
+            capture.operationTimestampMillis = System.currentTimeMillis();
+            capture.recordTimestampMillis = record.timestamp() != null
+                    ? record.timestamp()
+                    : capture.operationTimestampMillis;
             capture.bootstrapServer = clientInfo.bootstrapServer;
             capture.clientId = clientInfo.clientId;
             capture.clusterName = clientInfo.clusterName;
             if (record.partition() != null) {
                 capture.partition = record.partition();
             }
-            capture.metadata = TreblleContext.takeSnapshot();
+            capture.metadata = TreblleContext.forSend();
             return capture;
         } catch (Throwable t) {
             treblle.logger().error("failed to capture produced record", t);
@@ -157,10 +176,11 @@ final class TreblleProducer<K, V> implements Producer<K, V> {
         delegate.beginTransaction();
     }
 
-    @Override
+    /** kafka-clients 3.x only; removed in 4.0. */
     public void sendOffsetsToTransaction(
             Map<TopicPartition, OffsetAndMetadata> offsets, String consumerGroupId) {
-        delegate.sendOffsetsToTransaction(offsets, consumerGroupId);
+        invoke("sendOffsetsToTransaction",
+                new Class<?>[] {Map.class, String.class}, offsets, consumerGroupId);
     }
 
     @Override
@@ -194,9 +214,19 @@ final class TreblleProducer<K, V> implements Producer<K, V> {
         return delegate.metrics();
     }
 
-    @Override
+    /** kafka-clients 3.7+. */
     public Uuid clientInstanceId(Duration timeout) {
-        return delegate.clientInstanceId(timeout);
+        return (Uuid) invoke("clientInstanceId", new Class<?>[] {Duration.class}, timeout);
+    }
+
+    /** kafka-clients 4.0+. */
+    public void registerMetricForSubscription(KafkaMetric metric) {
+        invoke("registerMetricForSubscription", new Class<?>[] {KafkaMetric.class}, metric);
+    }
+
+    /** kafka-clients 4.0+. */
+    public void unregisterMetricFromSubscription(KafkaMetric metric) {
+        invoke("unregisterMetricFromSubscription", new Class<?>[] {KafkaMetric.class}, metric);
     }
 
     @Override
@@ -207,5 +237,27 @@ final class TreblleProducer<K, V> implements Producer<K, V> {
     @Override
     public void close(Duration timeout) {
         delegate.close(timeout);
+    }
+
+    /**
+     * Calls a {@code Producer} method that only exists in some {@code kafka-clients} versions. The
+     * delegate's own exceptions propagate unchanged; on a client that lacks the method this throws
+     * {@link UnsupportedOperationException}, just as calling it without the wrapper could not work.
+     */
+    private Object invoke(String name, Class<?>[] parameterTypes, Object... args) {
+        Method method;
+        try {
+            method = Producer.class.getMethod(name, parameterTypes);
+        } catch (NoSuchMethodException e) {
+            throw new UnsupportedOperationException(
+                    name + " is not available in this version of kafka-clients", e);
+        }
+        try {
+            return method.invoke(delegate, args);
+        } catch (InvocationTargetException e) {
+            throw TreblleConsumerTracker.<RuntimeException>sneakyThrow(e.getCause());
+        } catch (IllegalAccessException e) {
+            throw new UnsupportedOperationException(name + " could not be delegated", e);
+        }
     }
 }

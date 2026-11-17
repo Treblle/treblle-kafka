@@ -6,37 +6,23 @@ Discover, Govern, and Secure APIs, Agents, and AI Across Any Cloud, Gateway or T
 
 ## Treblle Kafka SDK (Java)
 
-The Treblle Kafka SDK brings Treblle's runtime intelligence to event-driven systems. It wraps your Kafka producer and your consume loop, captures every message together with its headers, payload, timing and outcome, masks sensitive values before anything leaves your JVM, and ships the result to Treblle - asynchronously, on its own threads, with a bounded queue and a circuit breaker so a Treblle outage can never slow down, block or break your application.
+The Treblle Kafka SDK brings Treblle's runtime intelligence to event-driven systems. It wraps your Kafka producer and your consume loop and captures each message with its headers, payload, timing and outcome. Sensitive values are masked inside your JVM before anything leaves it, and the result is shipped to Treblle asynchronously on the SDK's own threads. Bounded memory, a cap on in-flight requests and a circuit breaker keep a Treblle outage from slowing down or breaking your application.
 
-Because it decorates the client rather than the wire, it sees the typed value your code passed in - so a JSON message is readable in Treblle without a schema registry.
-
-> **This is a proof of concept.** It is the first Treblle SDK for AsyncAPI-style traffic, and it maps Kafka onto Treblle's existing HTTP-shaped payload so it works against the Treblle dashboard as it exists today. Read [How Kafka maps to Treblle](#how-kafka-maps-to-treblle) and [Known PoC limitations](#known-poc-limitations) before using it for anything that matters.
+Because it decorates the client instead of sitting on the wire, it sees the typed value your code passed in. JSON strings, JSON bytes and `Map`/`List` values are readable in Treblle without a schema registry, and POJOs are too once you plug in your JSON serialiser (see [Message bodies](#message-bodies)).
 
 ## Requirements
 
 | | |
 |---|---|
-| Java | 11 or newer |
-| Kafka clients | `org.apache.kafka:kafka-clients` 3.x or 4.x |
-| Runtime dependencies | **None.** JSON, GZIP and HTTP all come from the JDK. |
+| Java | 11 or newer (CI-tested on 11, 17 and 21) |
+| Kafka clients | `org.apache.kafka:kafka-clients` 3.0 to 4.x (CI-tested on 3.0.0, 3.9.0 and 4.1.0) |
+| Runtime dependencies | None. JSON, GZIP and HTTP all come from the JDK. |
 
-The SDK is compiled with `--release 11`, so the compiler enforces that it only uses Java 11 APIs. This PoC was built and exercised on Java 21; it has not yet been run on an 11 or 17 runtime.
-
-`kafka-clients` is a `provided` dependency - the SDK uses the copy your application already has. It is compiled against 3.9.0.
+`kafka-clients` is a `provided` dependency: the SDK uses the copy your application already has. The published jar is compiled against 3.9.0, and CI runs that same build against 3.0.0 and 4.1.0.
 
 ## Installation
 
-### 1. Install the SDK
-
-The PoC is not on Maven Central yet, so build and install it into your local repository:
-
-```bash
-git clone https://github.com/Treblle/treblle-kafka.git
-cd treblle-kafka
-mvn clean install
-```
-
-Then add it to your project.
+### 1. Add the dependency
 
 **Maven**
 
@@ -56,7 +42,7 @@ implementation 'com.treblle:treblle-kafka:1.0.0'
 
 ### 2. Configure the SDK
 
-Build one `Treblle` instance for the lifetime of your application. The minimum is an SDK Token and an API Key, both from the [Treblle Dashboard](https://app.treblle.com):
+Build one `Treblle` instance for the lifetime of your application. At minimum it needs an SDK Token and an API Key, both from the [Treblle Dashboard](https://app.treblle.com):
 
 ```java
 import com.treblle.kafka.Treblle;
@@ -67,7 +53,7 @@ Treblle treblle = Treblle.builder()
         .build();
 ```
 
-**Producing.** Wrap your producer. The second argument is the same `Properties` you built it with - the SDK reads `bootstrap.servers` and `client.id` from it once:
+**Producing.** Wrap your producer. The second argument is the same `Properties` you built it with; the SDK reads `bootstrap.servers` and `client.id` from it once:
 
 ```java
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -86,9 +72,9 @@ Producer<String, String> producer = treblle.wrap(new KafkaProducer<>(props), pro
 producer.send(new ProducerRecord<>("orders.created", orderId, orderJson));
 ```
 
-`treblle.wrap(...)` returns a `Producer<K, V>`, so it is a drop-in replacement - transactions, `flush()`, `partitionsFor()` and `metrics()` all delegate to the real producer untouched.
+`treblle.wrap(...)` returns a `Producer<K, V>`, so declare your variable as `Producer` rather than `KafkaProducer`. Transactions, `flush()`, `partitionsFor()`, `metrics()` and the version-specific methods (`clientInstanceId`, `registerMetricForSubscription`, ...) all delegate to the real producer unchanged.
 
-**Consuming.** Kafka has no response, so the SDK asks for the one thing only your code knows: the outcome of processing. Wrap your handler and Treblle gets real processing time and real errors:
+**Consuming.** Kafka has no response, so the SDK needs the one thing only your code knows: the outcome of processing. Wrap your handler and Treblle gets real processing time and real errors:
 
 ```java
 import com.treblle.kafka.TreblleConsumerTracker;
@@ -114,7 +100,7 @@ while (running) {
 }
 ```
 
-Anything your handler throws propagates unchanged - checked exceptions included, without forcing `throws` onto your consume loop. Treblle observes; it never swallows, wraps or alters your error handling.
+Anything your handler throws propagates unchanged, checked exceptions included, and you don't have to add `throws` to your consume loop. The SDK only observes and leaves your error handling alone.
 
 If your handler returns a value and you want it to show up as the response body in Treblle, use `trackResult`:
 
@@ -122,10 +108,34 @@ If your handler returns a value and you want it to show up as the response body 
 Receipt receipt = tracker.trackResult(record, r -> orderService.handleAndReturn(r.value()));
 ```
 
-Finally, shut the SDK down with your application so its worker threads stop cleanly:
+**Shutting down.** Close the SDK with your application. `close()` sends anything still queued (waiting up to 5 seconds), then stops the SDK's threads:
 
 ```java
-treblle.close();
+treblle.close();                         // or treblle.close(Duration.ofSeconds(10))
+```
+
+If you forget, a JVM shutdown hook does the same on a normal exit. For batch jobs and tests, `treblle.flush(Duration)` waits until everything captured so far has been sent, without shutting anything down.
+
+#### Spring Kafka
+
+Spring Kafka isn't integrated automatically, but both sides take a few lines. On the producing side, register a post-processor on your producer factory:
+
+```java
+@Bean
+public ProducerFactory<String, Order> producerFactory(Treblle treblle) {
+    DefaultKafkaProducerFactory<String, Order> factory = new DefaultKafkaProducerFactory<>(props());
+    factory.addPostProcessor(producer -> treblle.wrap(producer, factory.getConfigurationProperties()));
+    return factory;
+}
+```
+
+On the consuming side, take the `ConsumerRecord` in your listener and wrap the body:
+
+```java
+@KafkaListener(topics = "orders.created")
+public void onOrder(ConsumerRecord<String, Order> record) {
+    tracker.track(record, r -> orderService.handle(r.value()));
+}
 ```
 
 #### All configuration options
@@ -135,11 +145,14 @@ treblle.close();
 | `sdkToken` | `String` | Yes | - | From the Treblle Dashboard. Sent as `sdk_token` in the payload and as the `x-api-key` header on every request to Treblle. |
 | `apiKey` | `String` | Yes | - | From the Treblle Dashboard. Sent as `api_key` in the payload. |
 | `debug` | `boolean` | No | `false` | Logs all SDK activity locally. See [Debug mode](#debug-mode). |
-| `maskedKeywords` | `String...` | No | *(empty)* | Keys whose values are masked before sending. **Empty means masking is skipped entirely.** See [Data masking](#data-masking). |
-| `excludedTopics` | `String...` | No | *(empty)* | Topics the SDK must not track. Exact names and `prefix.*` wildcards. See [Excluding topics](#excluding-topics). |
-| `ingressEndpoint` | `String` | No | `https://ingress.treblle.com` | Ingestion URL. Point it at a regional endpoint or a self-hosted instance. |
+| `maskedKeywords` | `String...` | No | *(none)* | Extra keys to mask, **on top of** the built-in defaults. See [Data masking](#data-masking). |
+| `includedTopics` | `String...` | No | *(empty)* | The only topics the SDK tracks. Empty means every topic is a candidate. Exact names and `prefix.*` wildcards. See [Including and excluding topics](#including-and-excluding-topics). |
+| `excludedTopics` | `String...` | No | *(empty)* | Topics the SDK must not track. Exact names and `prefix.*` wildcards. |
+| `captureRecordKeys` | `boolean` | No | `true` | Whether record keys are reported as `kafka.key` metadata. Turn off if your keys contain personal data such as email addresses. |
+| `valueRenderer` | `ValueRenderer` | No | *(none)* | Turns POJO values into JSON, e.g. `objectMapper::writeValueAsString`. See [Message bodies](#message-bodies). |
+| `ingressEndpoint` | `String` | No | `https://ingress.treblle.com` | Ingestion URL. Must be `https`; plain `http` is accepted only for `localhost`. |
 | `enabled` | `boolean` | No | `true` | Master switch. When `false` the SDK sends nothing, even if fully configured. |
-| `clusterName` | `String` | No | first bootstrap server host | Friendly name for this Kafka cluster. Folded into `internal_id` (see [Auto API discovery](#auto-api-discovery)) so topics on different clusters never collide into the same auto-discovered API. |
+| `clusterName` | `String` | No | first bootstrap server host | Friendly name for this Kafka cluster. Included in `internal_id` (see [Auto API discovery](#auto-api-discovery)) so topics on different clusters never merge into the same auto-discovered API. |
 
 A fully configured instance:
 
@@ -148,8 +161,11 @@ Treblle treblle = Treblle.builder()
         .sdkToken("YOUR_SDK_TOKEN")
         .apiKey("YOUR_API_KEY")
         .debug(true)
-        .maskedKeywords("password", "authorization", "ssn", "credit_card")
+        .maskedKeywords("email", "iban")
+        .includedTopics("orders.*", "payments.*")
         .excludedTopics("payments.audit", "internal.*")
+        .captureRecordKeys(false)
+        .valueRenderer(objectMapper::writeValueAsString)
         .ingressEndpoint("https://ingress-eu.treblle.com")
         .clusterName("orders-prod-eu")
         .enabled(true)
@@ -158,7 +174,7 @@ Treblle treblle = Treblle.builder()
 
 #### Environment variables and system properties
 
-Every option can also be set outside your code. Resolution order is **builder value → JVM system property → environment variable → default**, so an explicitly configured value always wins.
+Every option except `valueRenderer` can also be set outside your code. Values resolve in this order: builder value, JVM system property, environment variable, default. A value set on the builder always wins, even an empty list: `.excludedTopics()` with no arguments means "exclude nothing", whatever the environment says.
 
 | Option | System property | Environment variable |
 |---|---|---|
@@ -166,7 +182,9 @@ Every option can also be set outside your code. Resolution order is **builder va
 | `apiKey` | `treblle.api.key` | `TREBLLE_API_KEY` |
 | `debug` | `treblle.debug` | `TREBLLE_DEBUG` |
 | `maskedKeywords` | `treblle.masked.keywords` | `TREBLLE_MASKED_KEYWORDS` |
+| `includedTopics` | `treblle.included.topics` | `TREBLLE_INCLUDED_TOPICS` |
 | `excludedTopics` | `treblle.excluded.topics` | `TREBLLE_EXCLUDED_TOPICS` |
+| `captureRecordKeys` | `treblle.capture.record.keys` | `TREBLLE_CAPTURE_RECORD_KEYS` |
 | `ingressEndpoint` | `treblle.ingress.endpoint` | `TREBLLE_INGRESS_ENDPOINT` |
 | `enabled` | `treblle.enabled` | `TREBLLE_ENABLED` |
 | `clusterName` | `treblle.cluster.name` | `TREBLLE_CLUSTER_NAME` |
@@ -180,16 +198,16 @@ Treblle treblle = Treblle.builder().build();
 ```bash
 export TREBLLE_SDK_TOKEN="YOUR_SDK_TOKEN"
 export TREBLLE_API_KEY="YOUR_API_KEY"
-export TREBLLE_MASKED_KEYWORDS="password,authorization,ssn"
+export TREBLLE_MASKED_KEYWORDS="email,iban"
 export TREBLLE_EXCLUDED_TOPICS="internal.*"
 ```
 
-If `sdkToken` or `apiKey` is missing, the SDK **disables itself silently** - it never throws. `treblle.wrap(...)` then hands your producer straight back, unwrapped, so there is not even a wrapper on the path. Turn on debug mode to see why.
+If `sdkToken` or `apiKey` is missing, the SDK **disables itself** and never throws. `treblle.wrap(...)` then returns your producer unwrapped, so no wrapper sits on the path at all. Turn on debug mode to see why.
 
 ### 3. Verify it works
 
 1. Start your application and produce a message to a topic that is not excluded.
-2. Open the [Treblle Dashboard](https://app.treblle.com) - the topic auto-discovers as its own API. The message appears as a request against `POST /<topic>`; consumed messages appear as `GET /<topic>`.
+2. Open the [Treblle Dashboard](https://app.treblle.com). The topic auto-discovers as its own API. Produced messages appear as requests against `POST /<topic>`; consumed messages appear as `GET /<topic>`.
 3. Nothing showing up? Enable debug mode:
 
 ```java
@@ -211,13 +229,17 @@ You should see the SDK announce itself at startup and log each send:
 
 ## Data masking
 
-Masking happens inside your JVM, before anything is sent. Only the keys you list in `maskedKeywords` are masked, matched **case-insensitively**, across request bodies, response bodies and headers.
+Masking happens inside your JVM before anything is sent, and it is **always on**. These keys are masked by default, matched case-insensitively:
+
+`password`, `pwd`, `secret`, `password_confirmation`, `passwordConfirmation`, `cc`, `card_number`, `cardNumber`, `ccv`, `cvv`, `ssn`, `credit_score`, `creditScore`, `authorization`, `proxy-authorization`, `api_key`, `apiKey`, `x-api-key`, `access_token`, `refresh_token`, `client_secret`, `token`, `cookie`, `set-cookie`
+
+`maskedKeywords` adds to this list. It never replaces it.
 
 ```java
 Treblle treblle = Treblle.builder()
         .sdkToken("YOUR_SDK_TOKEN")
         .apiKey("YOUR_API_KEY")
-        .maskedKeywords("password", "ssn", "card_number", "authorization")
+        .maskedKeywords("email", "secrets")
         .build();
 ```
 
@@ -238,7 +260,7 @@ with an `authorization: Bearer eyJhbGciOiJIUzI1` record header, Treblle receives
 {
   "orderId": "A-1",
   "card_number": "****************",
-  "customer": { "email": "ada@example.com", "password": "*********", "SSN": "***********" },
+  "customer": { "email": "***************", "password": "*********", "SSN": "***********" },
   "secrets": ["*****", "*****"]
 }
 ```
@@ -247,57 +269,95 @@ with an `authorization: Bearer eyJhbGciOiJIUzI1` record header, Treblle receives
 authorization: Bearer ****************
 ```
 
-The behaviour in detail:
+The rules in detail:
 
-- Every character of a matching value becomes `*`, so the **length is preserved** and you can still tell a 4-digit PIN from a 32-character token.
-- **Keys are always preserved** - only values are masked.
-- **Nested objects and arrays** are handled recursively; arrays keep their length and each item is masked individually.
-- **Auth schemes survive.** `Bearer abc123` becomes `Bearer ******`, so you can still see which auth type was used.
-- **`null` and empty values are skipped** - masking them would only invent data.
-- Matching is case-insensitive, so `SSN`, `ssn` and `Ssn` are all covered by listing `ssn` once.
+- Masking applies to request bodies, response bodies, record headers and your [per-message metadata](#per-message-metadata) (by metadata key).
+- Error messages and record keys can't be masked by key, so the SDK scrubs `keyword=value` and `keyword: value` patterns in them. `login failed for password=hunter2` becomes `login failed for password=*******`.
+- Every character of a matching value becomes `*`. Length is preserved, so you can still tell a 4-digit PIN from a 32-character token.
+- Keys are never masked, only values.
+- Nested objects and arrays are masked recursively. Arrays keep their length, and each item is masked individually.
+- Auth schemes are kept: `Bearer abc123` becomes `Bearer ******`, so you can still see which auth type was used.
+- `null` and empty values are left alone, since masking them would invent data.
 
-> **An empty `maskedKeywords` list disables masking entirely** and message bodies and headers are sent as-is. The SDK warns about this at startup in debug mode.
+What masking can't protect: topic names, header *names*, and free-form text that doesn't follow a `keyword=value` shape. If your record keys are personal data (an email address, say), set `captureRecordKeys(false)`.
 
-## Excluding topics
+## Message bodies
 
-`excludedTopics` is the Kafka equivalent of excluding paths in Treblle's HTTP SDKs. It accepts exact topic names and trailing wildcards:
+The SDK reads the value your code handed to the producer (or the deserialised value on the consumer side) and turns it into a JSON body:
+
+| Value type | What Treblle shows |
+|---|---|
+| `String` / `CharSequence` containing JSON | the parsed JSON |
+| `byte[]` / `ByteBuffer` containing UTF-8 JSON | the parsed JSON |
+| `Map`, `List` and other `Collection`s | the structure as JSON |
+| `Number`, `Boolean` | the scalar |
+| `null` (a tombstone) | `null` |
+| Binary data (Avro, Protobuf, ...) | `{"message": "Message payload is not valid JSON.", "type": "application/octet-stream", "size": ...}` |
+| Anything else (POJOs, Avro `GenericRecord`) | your `valueRenderer`'s output, or else the value's `toString()` if that is valid JSON |
+
+POJOs are the common case with JSON serialisers, so plug in the one you already use:
+
+```java
+ObjectMapper mapper = new ObjectMapper();
+
+Treblle treblle = Treblle.builder()
+        .sdkToken("YOUR_SDK_TOKEN")
+        .apiKey("YOUR_API_KEY")
+        .valueRenderer(mapper::writeValueAsString)
+        .build();
+```
+
+The renderer runs on the SDK's worker thread, never yours, and anything it throws is contained. Bodies over 2 MB are replaced with a short summary of their size. Oversized strings and byte arrays are detected and released on your thread, so the SDK never holds on to them.
+
+## Including and excluding topics
+
+`includedTopics` and `excludedTopics` work like the include and exclude path options in Treblle's HTTP SDKs. Both accept exact topic names and trailing wildcards (`orders.*` matches every topic starting with `orders.`), and matching is case-sensitive.
+
+Both are empty by default, so every topic is tracked. Setting `includedTopics` turns it into an allow-list: only matching topics are tracked, and everything else is treated as excluded.
 
 ```java
 Treblle treblle = Treblle.builder()
         .sdkToken("YOUR_SDK_TOKEN")
         .apiKey("YOUR_API_KEY")
+        .includedTopics(
+                "orders.*",         // only topics starting with "orders."
+                "payments.*")       // and "payments."
         .excludedTopics(
-                "payments.audit",   // this topic exactly
-                "internal.*")       // and everything starting with "internal."
+                "payments.audit",   // except this topic exactly
+                "internal.*")       // and anything starting with "internal."
         .build();
 ```
 
-Matching is case-sensitive.
+You can use both at once. `excludedTopics` is applied on top of `includedTopics` and wins when a topic matches both. The SDK decides each topic like this:
 
-The SDK also **always** skips Kafka's own internal topics, regardless of configuration - anything beginning with `__` (`__consumer_offsets`, `__transaction_state`) plus `_schemas` and the Confluent licensing topics. They carry no application traffic and would only add noise. This mirrors how Treblle's HTTP SDKs automatically skip static assets and `.well-known` paths.
+1. Kafka-internal topics are always excluded (see below). This check runs first, whatever the configuration.
+2. If `includedTopics` is non-empty, the topic must match it or it's excluded.
+3. If the topic matches `excludedTopics`, it's excluded, even if it matched `includedTopics`.
+
+With an empty `includedTopics` (the default), step 2 is skipped and `excludedTopics` alone decides what's left out.
+
+The SDK also always skips Kafka's own internal topics: anything beginning with `__` (`__consumer_offsets`, `__transaction_state`), plus `_schemas` and the Confluent licensing topics. They carry no application traffic. Treblle's HTTP SDKs skip static assets and `.well-known` paths for the same reason.
 
 In debug mode, every skipped topic is logged.
 
 ## Auto API discovery
 
-A single Kafka cluster is usually many independent async APIs sharing one set of brokers - each topic its own channel, often owned and versioned by a different team. The SDK reflects that: **every topic auto-discovers as its own API in the Treblle Dashboard**, not as one API for the whole cluster.
+A single Kafka cluster usually hosts many independent async APIs on one set of brokers. Each topic is its own channel, often owned and versioned by a different team, so every topic auto-discovers as its own API in the Treblle Dashboard instead of the whole cluster showing up as one.
 
-It does this the same way Treblle's HTTP SDKs support multiple logical APIs behind one SDK Token - by sending `internal_id` and `internal_name` in the payload:
+This uses the mechanism Treblle's HTTP SDKs already use to support several logical APIs behind one SDK Token. The SDK sends `internal_id` and `internal_name` in the payload:
 
 | Field | Value |
 |---|---|
 | `internal_name` | the topic name |
 | `internal_id` | `<clusterName>:<topic>` (cluster identity falls back to the first bootstrap server host) |
 
-The cluster identity is folded into `internal_id` - not just the topic name - so that if the same `sdkToken`/`apiKey` pair is ever pointed at two different clusters (e.g. staging and production) that happen to share a topic name, they still auto-discover as two separate APIs rather than merging into one.
+`internal_id` includes the cluster identity as well as the topic name. If the same `sdkToken`/`apiKey` pair is pointed at two clusters (staging and production, say) that share a topic name, the two topics still show up as separate APIs.
 
-You don't need to do anything to enable this: it's automatic as soon as a topic is captured. Set `clusterName` (see [All configuration options](#all-configuration-options)) if you want a friendlier cluster identity than the bootstrap host in that `internal_id`.
-
-> **This changes `internal_id`/`internal_name` on every payload compared to treating the whole cluster as one API.** If you're upgrading from a version of this SDK that sent cluster-level `internal_id`, expect topics to (re-)appear in the Dashboard as new, separate APIs rather than under one existing one.
+Discovery is automatic once a topic is captured. Set `clusterName` if you want a friendlier cluster identity in `internal_id` than the bootstrap host.
 
 ## Per-message metadata
 
-Attach your own key/value pairs to a message with `TreblleContext`. It is thread-scoped: set it on the thread that calls `send()`, or anywhere inside your consume handler.
+Attach your own key/value pairs to a message with `TreblleContext`. It is thread-scoped, so set it on the thread that calls `send()`, or anywhere inside your consume handler.
 
 ```java
 import com.treblle.kafka.TreblleContext;
@@ -315,11 +375,15 @@ tracker.track(record, r -> {
 });
 ```
 
-The SDK snapshots the context at capture time and clears it immediately, so values never leak into the next message on a pooled thread.
+How long metadata lives:
 
-Alongside your values, the SDK adds the Kafka coordinates automatically: `kafka.operation`, `kafka.topic`, `kafka.partition`, `kafka.offset`, `kafka.key`, `kafka.client.id`, `kafka.group.id` and `kafka.timestamp.type`. Treblle caps metadata at 20 properties, keys at 64 characters and values at 128 characters; the SDK's own entries come first and yours fill the rest.
+- **Producing:** every `send()` through a wrapped producer takes the metadata and clears it, even when the topic is excluded, so values never leak into the next message on a pooled thread.
+- **Consuming:** metadata set inside the handler belongs to that record and is cleared when the handler returns, whether or not the topic is tracked.
+- **Consume-then-produce:** a `send()` made from inside a handler is tagged with a copy of the handler's metadata, so both the consumed and the produced message carry it.
 
-> **Metadata is never masked.** Never put secrets, credentials or personal data there.
+The SDK also adds the Kafka coordinates automatically: `kafka.operation`, `kafka.topic`, `kafka.partition`, `kafka.offset`, `kafka.key`, `kafka.client.id`, `kafka.group.id` and `kafka.timestamp.type`. Treblle caps metadata at 20 properties, keys at 64 characters and values at 128 characters. The SDK's own entries come first, and yours fill the remaining slots.
+
+Metadata whose key is a masked keyword is masked. Even so, don't put secrets or personal data here.
 
 ## Debug mode
 
@@ -331,75 +395,40 @@ Treblle treblle = Treblle.builder()
         .build();
 ```
 
-Debug mode is silent by default and logs nothing in production unless you turn it on. When enabled it reports:
+Debug mode is off by default. When enabled it reports:
 
 - the resolved configuration and whether the SDK actually started (the SDK Token is never logged in full);
-- warnings for missing `sdkToken` / `apiKey`, and for an empty `maskedKeywords` list;
-- every topic skipped because of `excludedTopics` or because it is a Kafka internal topic;
+- warnings for a missing `sdkToken` / `apiKey`;
+- every topic skipped because of `includedTopics`/`excludedTopics` or because it is a Kafka internal topic;
 - every payload sent, Treblle's response, and any HTTP or transport error;
 - circuit breaker state changes and dropped payloads;
 - any payload field the validator had to repair before sending.
 
-Output goes through `java.util.logging` under the logger name `com.treblle.kafka`, so your existing logging setup - including SLF4J and Log4j JUL bridges - picks it up without the SDK taking a logging dependency.
+Two problems are logged even with debug mode off, once each, because otherwise the SDK would silently send nothing: Treblle rejecting your credentials (HTTP 401/403), and an `ingressEndpoint` that isn't a valid `https` URL.
+
+Output goes through `java.util.logging` under the logger name `com.treblle.kafka`. Your existing logging setup picks it up, including SLF4J and Log4j JUL bridges, and the SDK needs no logging dependency of its own.
 
 **Troubleshooting checklist**
 
 | Symptom | Likely cause |
 |---|---|
 | `SDK disabled` at startup | `sdkToken` or `apiKey` missing, or `enabled=false` |
-| `topic '...' is excluded; skipping` | `excludedTopics` matched, or it is a Kafka internal topic |
-| `circuit breaker open; dropping payloads` | Treblle returned 4xx/5xx - usually a bad SDK Token |
+| `Treblle rejected the SDK credentials` | Wrong `sdkToken` or `apiKey` |
+| `ingressEndpoint ... is not an https URL` | The endpoint uses `http` for a non-local host, or is malformed |
+| `topic '...' is excluded; skipping` | `excludedTopics` matched, `includedTopics` didn't, or it is a Kafka internal topic |
+| `circuit breaker open; dropping payloads` | Treblle returned 5xx, 429, 401 or 403, or was unreachable |
+| `Treblle rejected a payload (HTTP 4xx)` | That one payload was refused (e.g. too large); other payloads keep flowing |
 | Nothing logged at all | Debug mode is off, or your logging config filters `com.treblle.kafka` |
-
-## How Kafka maps to Treblle
-
-Treblle's payload schema was built for synchronous HTTP APIs. This SDK maps Kafka onto it **without changing a single schema field**, so the PoC works against the Treblle dashboard exactly as it exists today.
-
-| Treblle field | Producing | Consuming |
-|---|---|---|
-| `request.method` | `POST` | `GET` |
-| `request.route_path` | topic name | topic name |
-| `request.url` | `kafka://broker:9092/<topic>` | same |
-| `request.headers` | record headers | record headers |
-| `request.body` | the record value | the record value |
-| `request.timestamp` | record timestamp, UTC | record timestamp, UTC |
-| `response.code` | `200`, or a mapped code on failure | `200`, or a mapped code if the handler throws |
-| `response.load_time` | `send()` to broker acknowledgement | your handler's wall time |
-| `response.size` | serialised key + value bytes | serialised key + value bytes |
-| `response.body` | the broker's ack receipt (`topic`, `partition`, `offset`) | your handler's return value |
-| `response.headers` | `kafka-topic`, `kafka-partition`, `kafka-offset`, `kafka-timestamp` | plus `kafka-group-id`, `kafka-lag-ms` |
-| `errors[]` | send failure, `source: onError` | handler throwable, `source: onException` |
-| `queries[]` | always empty - Kafka has no SQL layer | same |
-| `internal_name` | topic name | same |
-| `internal_id` | `<clusterName>:<topic>` | same |
-
-**Why `POST` and `GET`?** The schema's `method` field is an enum of HTTP verbs. Rather than break it, producing maps to `POST` and consuming maps to `GET`. In practice this reads well: producing to `orders.created` shows up as `POST /orders.created` and consuming it as `GET /orders.created` - the producer view and the consumer view of the same channel, as two distinct endpoints. The true semantic is preserved in `metadata["kafka.operation"]` (`produce` / `consume`), so Treblle can switch to real AsyncAPI verbs later without a breaking payload change.
-
-**Kafka failures become status codes.** A send that times out reads as `504`, one rejected by ACLs as `403`, a record over `max.request.size` as `413`, an unknown topic as `404`, and anything Kafka considers retriable as `503`. The original exception class, message, file and line are always in `errors[]`.
 
 ### Why it never slows your application down
 
-- The wrapper does almost nothing on your thread: it grabs cheap references to the topic, key, value, headers and metadata, and returns. Masking, JSON, GZIP and HTTP all happen later.
+- On your thread, the wrapper only grabs references to the topic, key, value, headers and metadata, plus O(1) size checks, then returns. Copying, masking, JSON, GZIP and HTTP all happen later.
 - The producer's acknowledgement callback runs on Kafka's I/O thread, so it only pushes onto a bounded queue and returns.
-- One low-priority daemon thread drains that queue and builds payloads. Two more handle the HTTP.
-- The queue holds 1,000 captures and **drops the oldest** when full, so a burst or a stalled network can never grow your memory.
-- Sends are fire-and-forget with a 2-second connect and 3-second request timeout, and no retries.
-- A lock-free circuit breaker watches Treblle's responses. On 4xx/5xx it opens and **drops** payloads (never queues or delays them) with exponential backoff from 1s to 60s, ±20% jitter. A `429` with a `Retry-After` header is honoured, capped at 60 seconds. When the window expires it lets exactly one probe through; two consecutive successes close it again.
-- Every SDK operation is wrapped in try/catch. An internal SDK failure is logged in debug mode and otherwise ignored.
-
-In the verification harness, 200 sends against a completely unreachable Ingress endpoint cost 6 ms in total and threw nothing.
-
-## Known PoC limitations
-
-Be aware of these before relying on the SDK:
-
-- **No test suite or CI.** This PoC ships with the SDK and this README only. It was verified with a manual harness covering payload shape, masking, body edge cases, topic exclusion, config precedence, failure mapping, transport safety and the circuit breaker (157 checks), but that harness is not part of the repository.
-- **No Avro, Protobuf or Schema Registry decoding.** The SDK reads the typed value your code passed to the producer. JSON strings, `byte[]` containing JSON, `Map`/`List` structures and scalars are captured faithfully. A binary Avro or Protobuf payload is replaced with `{"message": "Message payload is not valid JSON.", "type": "application/octet-stream", "size": ...}` - you still see that a message flowed, just not its contents.
-- **The record value is captured by reference, not deep-copied.** Deep-copying every message would defeat the zero-overhead design. If your application mutates a value object after `send()` returns, Treblle may capture the mutated state. Sending immutable values or strings - which almost all producers do - avoids this entirely.
-- **Consuming requires wrapping your handler.** There is no zero-code-change option on the consume side, because processing time and handler errors are things only your code knows. A `ConsumerInterceptor` could capture messages at `poll()` with no code change, but it would report no processing time and no errors.
-- **Kafka Streams and Spring Kafka are not covered.** Only the plain `Producer` and `ConsumerRecord` APIs.
-- **`response.size` depends on the broker's acknowledgement.** Some clients (and `MockProducer`) report `-1` for serialised sizes, in which case the size is reported as `0`.
-- **Compiled against `kafka-clients` 3.9.0.** Older 3.x clients work; calling a 3.7+ method such as `clientInstanceId(Duration)` through the wrapper on an older client would fail, as it would without the wrapper.
+- One low-priority daemon thread drains that queue and builds payloads, and two more handle HTTP.
+- Memory has a hard ceiling. The queue holds at most 1,000 captures (dropping the oldest when full) and at most about 32 MB of referenced message values (dropping new captures when over budget). At most 8 requests to Treblle are in flight at once; when Treblle is slow, the queue absorbs the backlog and drops rather than piling up requests.
+- Sends have a 2-second connect timeout, a 3-second request timeout, and no retries.
+- A lock-free circuit breaker watches Treblle's responses. On a 5xx, a 429, a 401/403 or a network failure it opens and drops payloads instead of queuing or delaying them, backing off exponentially from 1s to 60s with ±20% jitter. A `429` with a `Retry-After` header is honoured, capped at 60 seconds. When the window expires it lets one probe through at a time, and two consecutive successes close it again. Any other 4xx (a `400` or `413` for one bad payload) drops just that payload and doesn't open the breaker.
+- Every SDK operation is wrapped in try/catch. Internal SDK failures are logged in debug mode and otherwise ignored.
 
 ## Support
 

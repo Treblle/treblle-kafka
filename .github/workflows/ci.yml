@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Java ${{ matrix.java }} / kafka-clients ${{ matrix.kafka }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['11', '17', '21']
+        # Oldest supported, the version the release is compiled against, and the newest.
+        kafka: ['3.0.0', '3.9.0', '4.1.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Build and test
+        run: mvn -B verify -Dkafka.version=${{ matrix.kafka }}
+
+  # The published jar is compiled against 3.9.0. Prove that exact build works on other clients.
+  binary-compatibility:
+    name: 3.9.0 build on kafka-clients ${{ matrix.kafka }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kafka: ['3.0.0', '4.1.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: maven
+      - name: Compile against 3.9.0
+        run: mvn -B compile
+      - name: Test those classes against ${{ matrix.kafka }}
+        run: mvn -B test -Dkafka.version=${{ matrix.kafka }} -Dmaven.main.skip=true

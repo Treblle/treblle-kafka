@@ -1,6 +1,9 @@
 package com.treblle.kafka;
 
-import com.treblle.kafka.core.Capture;
+import com.treblle.kafka.internal.core.BodyNormalizer;
+import com.treblle.kafka.internal.core.Capture;
+
+import java.util.Map;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
@@ -65,24 +68,30 @@ public final class TreblleConsumerTracker {
             ConsumerRecord<K, V> record, ReturningHandler<K, V, R> handler, boolean captureResult) {
         Capture capture = capture(record);
         long startNanos = System.nanoTime();
+        // Metadata set inside the handler belongs to this record and is cleared afterwards, even
+        // when the record is not tracked - see TreblleContext.
+        TreblleContext.openHandlerScope();
+        R result;
         try {
-            R result = handler.handle(record);
-            if (capture != null) {
-                // A void handler leaves response.body as {} rather than null - null would read as
-                // "the handler returned nothing" when it in fact returns nothing by design.
-                capture.hasHandlerResult = captureResult;
-                capture.handlerResult = result;
-                finish(capture, startNanos, null);
-            }
-            return result;
+            result = handler.handle(record);
         } catch (Throwable t) {
+            Map<String, Object> metadata = TreblleContext.closeHandlerScope();
             if (capture != null) {
-                finish(capture, startNanos, t);
+                finish(capture, startNanos, t, metadata);
             }
             // Observe, never interfere: the application sees exactly the exception it would have
             // seen without Treblle in the way.
-            throw rethrow(t);
+            throw sneakyThrow(t);
         }
+        Map<String, Object> metadata = TreblleContext.closeHandlerScope();
+        if (capture != null) {
+            // A void handler leaves response.body as {} rather than null - null would read as
+            // "the handler returned nothing" when it in fact returns nothing by design.
+            capture.hasHandlerResult = captureResult;
+            capture.handlerResult = result;
+            finish(capture, startNanos, null, metadata);
+        }
+        return result;
     }
 
     private <K, V> Capture capture(ConsumerRecord<K, V> record) {
@@ -93,8 +102,13 @@ public final class TreblleConsumerTracker {
             Capture capture = new Capture();
             capture.operation = Capture.OPERATION_CONSUME;
             capture.topic = record.topic();
-            capture.key = ClientInfo.renderKey(record.key());
-            capture.value = record.value();
+            capture.key = treblle.getConfig().isCaptureRecordKeys()
+                    ? ClientInfo.renderKey(record.key())
+                    : null;
+            Map<String, Object> oversized = BodyNormalizer.oversizedPlaceholder(record.value());
+            capture.value = oversized != null ? oversized : record.value();
+            capture.estimatedBytes = BodyNormalizer.estimateBytes(capture.value);
+            capture.operationTimestampMillis = System.currentTimeMillis();
             capture.headers = ClientInfo.flattenHeaders(record.headers());
             capture.recordTimestampMillis = record.timestamp();
             capture.partition = record.partition();
@@ -112,7 +126,7 @@ public final class TreblleConsumerTracker {
             // inflate the reported lag.
             if (record.timestamp() > 0) {
                 capture.consumerLagMillis =
-                        Math.max(0, System.currentTimeMillis() - record.timestamp());
+                        Math.max(0, capture.operationTimestampMillis - record.timestamp());
             }
             return capture;
         } catch (Throwable t) {
@@ -121,11 +135,15 @@ public final class TreblleConsumerTracker {
         }
     }
 
-    private void finish(Capture capture, long startNanos, Throwable failure) {
+    private void finish(
+            Capture capture, long startNanos, Throwable failure, Map<String, Object> metadata) {
         try {
             capture.durationMillis = (System.nanoTime() - startNanos) / 1_000_000.0;
             capture.failure = failure;
-            capture.metadata = TreblleContext.takeSnapshot();
+            capture.metadata = metadata;
+            if (capture.hasHandlerResult) {
+                capture.estimatedBytes += BodyNormalizer.estimateBytes(capture.handlerResult);
+            }
             treblle.submit(capture);
         } catch (Throwable t) {
             treblle.logger().error("failed to report consumed record", t);
@@ -137,7 +155,7 @@ public final class TreblleConsumerTracker {
      * {@code throws Exception} on every consume loop.
      */
     @SuppressWarnings("unchecked")
-    private static <T extends Throwable> RuntimeException rethrow(Throwable t) throws T {
+    static <T extends Throwable> RuntimeException sneakyThrow(Throwable t) throws T {
         throw (T) t;
     }
 }

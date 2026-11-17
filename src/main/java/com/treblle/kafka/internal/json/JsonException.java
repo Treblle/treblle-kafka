@@ -1,4 +1,4 @@
-package com.treblle.kafka.json;
+package com.treblle.kafka.internal.json;
 
 /**
  * Thrown when a document cannot be parsed as JSON.

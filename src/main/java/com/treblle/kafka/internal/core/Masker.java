@@ -1,4 +1,4 @@
-package com.treblle.kafka.core;
+package com.treblle.kafka.internal.core;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -8,16 +8,21 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Replaces sensitive values with asterisks before anything leaves the host application.
  *
- * <p>Only the keys listed in {@code maskedKeywords} are masked, matched case-insensitively.
+ * <p>The keys listed in {@code maskedKeywords} (the SDK's defaults plus any configured ones) are
+ * masked, matched case-insensitively.
  * Masking preserves structure and length so the shape of the data stays readable in Treblle: keys
  * survive, arrays keep their length, and {@code Bearer abc123} becomes {@code Bearer ******} so
  * users can still tell which auth scheme was used.
  *
- * <p>An empty keyword set disables masking entirely, which the SDK warns about in debug mode.
+ * <p>Free text the SDK cannot parse as key/value structure - exception messages - is scrubbed for
+ * {@code keyword=value} and {@code keyword: value} pairs, which is how secrets usually leak into
+ * error messages.
  */
 public final class Masker {
 
@@ -25,10 +30,33 @@ public final class Masker {
             "bearer", "basic", "digest", "token", "apikey", "negotiate", "oauth", "hmac"));
 
     private final Set<String> keywords;
+    private final Pattern textPattern;
 
     /** @param keywords keys to mask, expected to already be lowercased */
     public Masker(Set<String> keywords) {
         this.keywords = keywords == null ? java.util.Collections.emptySet() : keywords;
+        this.textPattern = buildTextPattern(this.keywords);
+    }
+
+    /**
+     * Matches {@code keyword}, an optional closing quote, {@code =} or {@code :}, an optional
+     * opening quote and auth scheme - then captures the value up to the next delimiter.
+     */
+    private static Pattern buildTextPattern(Set<String> keywords) {
+        if (keywords.isEmpty()) {
+            return null;
+        }
+        StringBuilder alternatives = new StringBuilder();
+        for (String keyword : keywords) {
+            if (alternatives.length() > 0) {
+                alternatives.append('|');
+            }
+            alternatives.append(Pattern.quote(keyword));
+        }
+        return Pattern.compile(
+                "(?<![\\w-])((?:" + alternatives + ")[\"']?\\s*[=:]\\s*[\"']?"
+                        + "(?:(?:bearer|basic|token|digest)\\s+)?)([^\\s\"',;&}\\]]+)",
+                Pattern.CASE_INSENSITIVE);
     }
 
     public boolean isActive() {
@@ -63,6 +91,41 @@ public final class Masker {
             } else {
                 masked.put(key, value);
             }
+        }
+        return masked;
+    }
+
+    /** Masks {@code keyword=value} / {@code keyword: value} pairs inside free text. */
+    public String maskText(String text) {
+        if (textPattern == null || text == null || text.isEmpty()) {
+            return text;
+        }
+        Matcher matcher = textPattern.matcher(text);
+        if (!matcher.find()) {
+            return text;
+        }
+        StringBuffer result = new StringBuffer(text.length());
+        do {
+            matcher.appendReplacement(result,
+                    Matcher.quoteReplacement(matcher.group(1) + stars(matcher.group(2).length())));
+        } while (matcher.find());
+        matcher.appendTail(result);
+        return result.toString();
+    }
+
+    /**
+     * Masks metadata entries whose key is a masked keyword. Values are scalars, so a match is
+     * replaced outright.
+     */
+    public Map<String, Object> maskMetadata(Map<String, Object> metadata) {
+        if (!isActive() || metadata == null || metadata.isEmpty()) {
+            return metadata;
+        }
+        Map<String, Object> masked = new LinkedHashMap<>(metadata.size());
+        for (Map.Entry<String, Object> entry : metadata.entrySet()) {
+            masked.put(entry.getKey(), matches(entry.getKey())
+                    ? maskScalar(entry.getValue())
+                    : entry.getValue());
         }
         return masked;
     }

@@ -1,4 +1,4 @@
-package com.treblle.kafka.core;
+package com.treblle.kafka.internal.core;
 
 import java.util.HashMap;
 import java.util.LinkedHashMap;

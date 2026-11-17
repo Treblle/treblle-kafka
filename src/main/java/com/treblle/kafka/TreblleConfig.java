@@ -19,6 +19,9 @@ import java.util.Set;
  *   <li>an environment variable, e.g. {@code TREBLLE_SDK_TOKEN}
  * </ol>
  *
+ * <p>A value set on the builder always wins, even an empty list - so {@code excludedTopics()} with no
+ * arguments really means "exclude nothing", whatever the environment says.
+ *
  * <p>The SDK never throws over bad configuration. If {@code sdkToken} or {@code apiKey} is
  * missing, {@link #isValid()} returns false, the SDK disables itself, and a warning is emitted in
  * debug mode.
@@ -27,6 +30,18 @@ public final class TreblleConfig {
 
     public static final String DEFAULT_INGRESS_ENDPOINT = "https://ingress.treblle.com";
 
+    /**
+     * Keys that are always masked, whatever {@code maskedKeywords} says. Configured keywords are
+     * added to these, never substituted for them.
+     */
+    public static final List<String> DEFAULT_MASKED_KEYWORDS = Collections.unmodifiableList(
+            Arrays.asList(
+                    "password", "pwd", "secret", "password_confirmation", "passwordconfirmation",
+                    "cc", "card_number", "cardnumber", "ccv", "cvv", "ssn", "credit_score",
+                    "creditscore", "authorization", "proxy-authorization", "api_key", "apikey",
+                    "x-api-key", "access_token", "refresh_token", "client_secret", "token",
+                    "cookie", "set-cookie"));
+
     private final String sdkToken;
     private final String apiKey;
     private final boolean debug;
@@ -34,7 +49,10 @@ public final class TreblleConfig {
     private final String ingressEndpoint;
     private final String clusterName;
     private final Set<String> maskedKeywords;
+    private final List<String> includedTopics;
     private final List<String> excludedTopics;
+    private final boolean captureRecordKeys;
+    private final ValueRenderer valueRenderer;
 
     private TreblleConfig(Builder builder) {
         this.sdkToken = resolve(builder.sdkToken, "treblle.sdk.token", "TREBLLE_SDK_TOKEN", null);
@@ -48,10 +66,17 @@ public final class TreblleConfig {
                 DEFAULT_INGRESS_ENDPOINT);
         this.clusterName =
                 resolve(builder.clusterName, "treblle.cluster.name", "TREBLLE_CLUSTER_NAME", null);
-        this.maskedKeywords = Collections.unmodifiableSet(lowercased(resolveList(
-                builder.maskedKeywords, "treblle.masked.keywords", "TREBLLE_MASKED_KEYWORDS")));
+        List<String> keywords = new ArrayList<>(DEFAULT_MASKED_KEYWORDS);
+        keywords.addAll(resolveList(
+                builder.maskedKeywords, "treblle.masked.keywords", "TREBLLE_MASKED_KEYWORDS"));
+        this.maskedKeywords = Collections.unmodifiableSet(lowercased(keywords));
+        this.includedTopics = Collections.unmodifiableList(resolveList(
+                builder.includedTopics, "treblle.included.topics", "TREBLLE_INCLUDED_TOPICS"));
         this.excludedTopics = Collections.unmodifiableList(resolveList(
                 builder.excludedTopics, "treblle.excluded.topics", "TREBLLE_EXCLUDED_TOPICS"));
+        this.captureRecordKeys = resolveBoolean(builder.captureRecordKeys,
+                "treblle.capture.record.keys", "TREBLLE_CAPTURE_RECORD_KEYS", true);
+        this.valueRenderer = builder.valueRenderer;
     }
 
     public static Builder builder() {
@@ -82,13 +107,30 @@ public final class TreblleConfig {
         return clusterName;
     }
 
-    /** Keywords to mask, already lowercased for case-insensitive comparison. */
+    /**
+     * Keywords to mask - {@link #DEFAULT_MASKED_KEYWORDS} plus any configured ones - already
+     * lowercased for case-insensitive comparison. Never empty.
+     */
     public Set<String> getMaskedKeywords() {
         return maskedKeywords;
     }
 
+    public List<String> getIncludedTopics() {
+        return includedTopics;
+    }
+
     public List<String> getExcludedTopics() {
         return excludedTopics;
+    }
+
+    /** Whether record keys are reported as {@code kafka.key} metadata. */
+    public boolean isCaptureRecordKeys() {
+        return captureRecordKeys;
+    }
+
+    /** Renders record values the SDK does not understand natively, or null. */
+    public ValueRenderer getValueRenderer() {
+        return valueRenderer;
     }
 
     /**
@@ -107,7 +149,10 @@ public final class TreblleConfig {
                 + ", apiKey=" + redact(apiKey)
                 + ", ingressEndpoint=" + ingressEndpoint
                 + ", maskedKeywords=" + maskedKeywords.size()
-                + ", excludedTopics=" + excludedTopics;
+                + ", includedTopics=" + includedTopics
+                + ", excludedTopics=" + excludedTopics
+                + ", captureRecordKeys=" + captureRecordKeys
+                + ", valueRenderer=" + (valueRenderer == null ? "none" : "custom");
     }
 
     private static String redact(String value) {
@@ -155,8 +200,15 @@ public final class TreblleConfig {
 
     private static List<String> resolveList(
             List<String> explicit, String systemProperty, String environmentVariable) {
-        if (explicit != null && !explicit.isEmpty()) {
-            return new ArrayList<>(explicit);
+        if (explicit != null) {
+            // Set on the builder - even if empty, that is a deliberate choice and wins.
+            List<String> values = new ArrayList<>();
+            for (String value : explicit) {
+                if (value != null && !value.trim().isEmpty()) {
+                    values.add(value.trim());
+                }
+            }
+            return values;
         }
         String raw = resolve(null, systemProperty, environmentVariable, null);
         List<String> values = new ArrayList<>();
@@ -207,7 +259,10 @@ public final class TreblleConfig {
         private String ingressEndpoint;
         private String clusterName;
         private List<String> maskedKeywords;
+        private List<String> includedTopics;
         private List<String> excludedTopics;
+        private Boolean captureRecordKeys;
+        private ValueRenderer valueRenderer;
 
         private Builder() {
         }
@@ -253,27 +308,66 @@ public final class TreblleConfig {
             return this;
         }
 
-        /** Keys whose values are masked before sending. Empty disables masking entirely. */
+        /**
+         * Extra keys whose values are masked before sending, on top of
+         * {@link TreblleConfig#DEFAULT_MASKED_KEYWORDS}. The defaults always apply.
+         */
         public Builder maskedKeywords(String... maskedKeywords) {
-            this.maskedKeywords = Arrays.asList(maskedKeywords);
+            this.maskedKeywords = maskedKeywords == null ? null : Arrays.asList(maskedKeywords);
             return this;
         }
 
-        /** Keys whose values are masked before sending. Empty disables masking entirely. */
+        /** Extra keys whose values are masked. See the varargs overload. */
         public Builder maskedKeywords(List<String> maskedKeywords) {
             this.maskedKeywords = maskedKeywords;
             return this;
         }
 
+        /**
+         * Topics the SDK must track, to the exclusion of all others. Supports exact names and
+         * {@code prefix.*} wildcards. Empty (the default) means every topic is a candidate. When
+         * both {@code includedTopics} and {@code excludedTopics} are non-empty, a topic must match
+         * {@code includedTopics} and must not match {@code excludedTopics} - the two are not
+         * mutually exclusive, and {@code excludedTopics} wins on overlap.
+         */
+        public Builder includedTopics(String... includedTopics) {
+            this.includedTopics = includedTopics == null ? null : Arrays.asList(includedTopics);
+            return this;
+        }
+
+        /** Topics the SDK must track, to the exclusion of all others. See the varargs overload. */
+        public Builder includedTopics(List<String> includedTopics) {
+            this.includedTopics = includedTopics;
+            return this;
+        }
+
         /** Topics the SDK must not track. Supports exact names and {@code prefix.*} wildcards. */
         public Builder excludedTopics(String... excludedTopics) {
-            this.excludedTopics = Arrays.asList(excludedTopics);
+            this.excludedTopics = excludedTopics == null ? null : Arrays.asList(excludedTopics);
             return this;
         }
 
         /** Topics the SDK must not track. Supports exact names and {@code prefix.*} wildcards. */
         public Builder excludedTopics(List<String> excludedTopics) {
             this.excludedTopics = excludedTopics;
+            return this;
+        }
+
+        /**
+         * Whether record keys are reported as {@code kafka.key} metadata. Defaults to true. Turn it
+         * off if your keys carry personal data such as email addresses.
+         */
+        public Builder captureRecordKeys(boolean captureRecordKeys) {
+            this.captureRecordKeys = captureRecordKeys;
+            return this;
+        }
+
+        /**
+         * Renders record values the SDK does not understand natively (typically POJOs) into JSON.
+         * See {@link ValueRenderer}.
+         */
+        public Builder valueRenderer(ValueRenderer valueRenderer) {
+            this.valueRenderer = valueRenderer;
             return this;
         }
 

@@ -1,4 +1,4 @@
-package com.treblle.kafka.util;
+package com.treblle.kafka.internal.util;
 
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -6,9 +6,13 @@ import java.util.logging.Logger;
 /**
  * Debug output for the SDK.
  *
- * <p>Silent unless {@code debug} is enabled. Uses {@code java.util.logging} so the host
- * application's existing logging configuration (including SLF4J/Log4j JUL bridges) picks the
- * output up without the SDK taking a logging dependency.
+ * <p>Silent unless {@code debug} is enabled, apart from {@link #alwaysWarn} which is reserved for
+ * misconfiguration that would otherwise make the SDK silently send nothing. Uses
+ * {@code java.util.logging} so the host application's existing logging configuration (including
+ * SLF4J/Log4j JUL bridges) picks the output up without the SDK taking a logging dependency.
+ *
+ * <p>Callers on a hot path must check {@link #isEnabled()} before building a message string, so a
+ * disabled logger costs nothing.
  */
 public final class DebugLogger {
 
@@ -36,6 +40,14 @@ public final class DebugLogger {
         if (enabled) {
             LOGGER.log(Level.WARNING, "[Treblle] {0}", message);
         }
+    }
+
+    /**
+     * Logs a configuration problem that stops the SDK sending anything, whether or not debug mode
+     * is on. Use sparingly - at most once per cause.
+     */
+    public void alwaysWarn(String message) {
+        LOGGER.log(Level.WARNING, "[Treblle] {0}", message);
     }
 
     /** Logs an internal SDK failure. No-op unless debug mode is on. */

@@ -15,15 +15,37 @@ import java.util.Map;
  * producer.send(record);
  * }</pre>
  *
- * <p>The SDK takes a snapshot at capture time and clears the thread's context immediately, so
- * values never leak into the next message on a pooled thread.
+ * <p>Lifecycle rules:
  *
- * <p><strong>Metadata is never masked.</strong> Never put secrets, credentials or personal data
- * here.
+ * <ul>
+ *   <li>Outside a consume handler, every {@code send()} through a wrapped producer takes the
+ *       metadata and clears it - whether or not that topic is tracked - so values never leak into
+ *       the next message on a pooled thread.
+ *   <li>Inside a consume handler, metadata belongs to the consumed message. It is cleared when the
+ *       handler returns. A {@code send()} made from inside the handler (consume-transform-produce)
+ *       is tagged with a <em>copy</em> of it, so both the consume and the produce carry it.
+ *   <li>Metadata set before {@code track(...)} is not attached to the consumed message; it stays
+ *       for the next {@code send()} outside the handler.
+ * </ul>
+ *
+ * <p>Metadata whose key is a masked keyword is masked like any other value. Even so, do not put
+ * secrets or personal data here.
  */
 public final class TreblleContext {
 
-    private static final ThreadLocal<Map<String, Object>> CONTEXT = new ThreadLocal<>();
+    /** One level of metadata. Handlers open a nested frame so they never see or clear outer values. */
+    private static final class Frame {
+        final Frame parent;
+        final boolean handlerScope;
+        Map<String, Object> values;
+
+        Frame(Frame parent, boolean handlerScope) {
+            this.parent = parent;
+            this.handlerScope = handlerScope;
+        }
+    }
+
+    private static final ThreadLocal<Frame> CURRENT = new ThreadLocal<>();
 
     private TreblleContext() {
     }
@@ -43,23 +65,57 @@ public final class TreblleContext {
         store(key, value);
     }
 
-    /** Discards any metadata set on the current thread. */
+    /** Discards any metadata set for the current message. */
     public static void clear() {
-        CONTEXT.remove();
+        Frame frame = CURRENT.get();
+        if (frame == null) {
+            return;
+        }
+        if (frame.handlerScope) {
+            frame.values = null;
+        } else {
+            CURRENT.remove();
+        }
     }
 
+    // --- Internal API used by the collectors. -------------------------------------------------
+
     /**
-     * Returns the current thread's metadata and clears it.
-     *
-     * <p>Internal SDK use. Never throws.
+     * Returns the metadata for a message being produced. Outside a handler the metadata is taken
+     * and cleared; inside a handler a copy is returned and the handler's metadata is left intact.
      */
-    public static Map<String, Object> takeSnapshot() {
-        Map<String, Object> current = CONTEXT.get();
-        if (current == null || current.isEmpty()) {
+    static Map<String, Object> forSend() {
+        Frame frame = CURRENT.get();
+        if (frame == null) {
             return Collections.emptyMap();
         }
-        CONTEXT.remove();
-        return current;
+        if (frame.handlerScope) {
+            return frame.values == null || frame.values.isEmpty()
+                    ? Collections.<String, Object>emptyMap()
+                    : new LinkedHashMap<>(frame.values);
+        }
+        CURRENT.remove();
+        return frame.values == null ? Collections.<String, Object>emptyMap() : frame.values;
+    }
+
+    /** Opens a handler scope. Must be paired with {@link #closeHandlerScope()} in a finally. */
+    static void openHandlerScope() {
+        CURRENT.set(new Frame(CURRENT.get(), true));
+    }
+
+    /** Closes the innermost handler scope and returns the metadata set inside it. */
+    static Map<String, Object> closeHandlerScope() {
+        Frame frame = CURRENT.get();
+        if (frame == null || !frame.handlerScope) {
+            // Defensive: the user cleared or replaced the scope. Nothing sensible to return.
+            return Collections.emptyMap();
+        }
+        if (frame.parent == null) {
+            CURRENT.remove();
+        } else {
+            CURRENT.set(frame.parent);
+        }
+        return frame.values == null ? Collections.<String, Object>emptyMap() : frame.values;
     }
 
     private static void store(String key, Object value) {
@@ -67,12 +123,15 @@ public final class TreblleContext {
             if (key == null || key.trim().isEmpty() || value == null) {
                 return;
             }
-            Map<String, Object> current = CONTEXT.get();
-            if (current == null) {
-                current = new LinkedHashMap<>();
-                CONTEXT.set(current);
+            Frame frame = CURRENT.get();
+            if (frame == null) {
+                frame = new Frame(null, false);
+                CURRENT.set(frame);
             }
-            current.put(key, value);
+            if (frame.values == null) {
+                frame.values = new LinkedHashMap<>();
+            }
+            frame.values.put(key, value);
         } catch (RuntimeException ignored) {
             // Metadata is a convenience. It must never disrupt the host application.
         }

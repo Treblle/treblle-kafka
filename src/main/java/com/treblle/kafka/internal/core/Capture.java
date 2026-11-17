@@ -1,4 +1,4 @@
-package com.treblle.kafka.core;
+package com.treblle.kafka.internal.core;
 
 import java.util.Collections;
 import java.util.Map;
@@ -26,22 +26,39 @@ public final class Capture {
     /** Topic name. Becomes {@code request.route_path} - the AsyncAPI channel. */
     public String topic;
 
-    /** Record key rendered as a string, or null. Reported in metadata, never as the body. */
+    /**
+     * Record key rendered as a string, or null when absent or when {@code captureRecordKeys} is
+     * off. Reported in metadata, never as the body.
+     */
     public String key;
 
     /**
      * The record value, captured by reference.
      *
-     * <p>Deep-copying every message would defeat the SDK's zero-overhead goal, so a value mutated
-     * by the application after {@code send()} returns may be captured in its mutated state. This
-     * is documented in the README.
+     * <p>Deep-copying every message on the caller's thread would defeat the SDK's zero-overhead
+     * goal, so the worker takes a private copy as its first step. A value the application mutates
+     * in the meantime may be captured in its mutated state; one mutated <em>during</em> the copy is
+     * replaced with an explanatory placeholder rather than dropped. Values over the body limit are
+     * swapped for a placeholder on the caller's thread, so the queue never holds them.
      */
     public Object value;
+
+    /**
+     * Rough size in bytes of what this capture keeps alive (mostly {@link #value}). Computed on
+     * the caller's thread from O(1) facts only; drives the dispatcher's memory budget.
+     */
+    public long estimatedBytes;
 
     /** Record headers, already flattened to strings. Last value wins for repeated keys. */
     public Map<String, String> headers = Collections.emptyMap();
 
-    /** Record timestamp in epoch millis, or 0 when unavailable. */
+    /**
+     * When the operation happened, in epoch millis: the {@code send()} call, or the moment the
+     * consume handler started. Becomes {@code request.timestamp}.
+     */
+    public long operationTimestampMillis;
+
+    /** The record's own Kafka timestamp in epoch millis, or 0 when unavailable. */
     public long recordTimestampMillis;
 
     /** Kafka's timestamp type, e.g. {@code CreateTime}. */

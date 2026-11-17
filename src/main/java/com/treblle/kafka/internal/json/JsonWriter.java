@@ -1,4 +1,4 @@
-package com.treblle.kafka.json;
+package com.treblle.kafka.internal.json;
 
 import java.util.Collection;
 import java.util.Map;
@@ -23,8 +23,9 @@ public final class JsonWriter {
     }
 
     private static void writeValue(StringBuilder sb, Object value, int depth) {
-        if (depth > JsonParser.MAX_DEPTH) {
-            // Defensive: a cyclic structure would otherwise recurse forever.
+        if (depth >= JsonParser.MAX_DEPTH) {
+            // Defensive: a cyclic structure would otherwise recurse forever. Using the parser's
+            // limit means anything written here can always be parsed back.
             sb.append("null");
             return;
         }
@@ -42,6 +43,9 @@ public final class JsonWriter {
             writeArray(sb, (Collection<?>) value, depth);
         } else if (value instanceof Object[]) {
             writeArray(sb, java.util.Arrays.asList((Object[]) value), depth);
+        } else if (value instanceof byte[]) {
+            // Raw bytes nested in a structure; their identity hash code would be meaningless.
+            writeString(sb, "<binary, " + ((byte[]) value).length + " bytes>");
         } else {
             writeString(sb, value.toString());
         }

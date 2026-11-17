@@ -1,4 +1,4 @@
-package com.treblle.kafka.json;
+package com.treblle.kafka.internal.json;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -25,7 +25,7 @@ import java.util.Map;
  * </ul>
  *
  * <p>Nesting is capped at {@link #MAX_DEPTH} so a hostile or malformed message cannot blow the
- * stack of a Kafka I/O thread.
+ * stack of the SDK's worker thread.
  */
 public final class JsonParser {
 
@@ -224,41 +224,57 @@ public final class JsonParser {
         }
     }
 
+    /** Reads an RFC 8259 number: {@code -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?}. */
     private Object readNumber() {
         int start = pos;
-        if (peek() == '-') {
+        if (pos < source.length() && source.charAt(pos) == '-') {
             pos++;
         }
-        while (pos < source.length() && isNumberChar(source.charAt(pos))) {
+        if (pos < source.length() && source.charAt(pos) == '0') {
             pos++;
-        }
-        String literal = source.substring(start, pos);
-        if (literal.isEmpty() || literal.equals("-")) {
+        } else if (!readDigits()) {
             throw new JsonException("invalid value at position " + start);
         }
-        boolean fractional = literal.indexOf('.') >= 0
-                || literal.indexOf('e') >= 0
-                || literal.indexOf('E') >= 0;
-        try {
-            if (!fractional) {
+        boolean fractional = false;
+        if (pos < source.length() && source.charAt(pos) == '.') {
+            pos++;
+            fractional = true;
+            if (!readDigits()) {
+                throw new JsonException("invalid number at position " + start);
+            }
+        }
+        if (pos < source.length() && (source.charAt(pos) == 'e' || source.charAt(pos) == 'E')) {
+            pos++;
+            fractional = true;
+            if (pos < source.length() && (source.charAt(pos) == '+' || source.charAt(pos) == '-')) {
+                pos++;
+            }
+            if (!readDigits()) {
+                throw new JsonException("invalid number at position " + start);
+            }
+        }
+        String literal = source.substring(start, pos);
+        if (!fractional) {
+            try {
                 return Long.valueOf(literal);
+            } catch (NumberFormatException ignored) {
+                // Integral but wider than a long - fall through to double.
             }
-        } catch (NumberFormatException ignored) {
-            // Integral but wider than a long - fall through to double.
         }
-        try {
-            double parsed = Double.parseDouble(literal);
-            if (Double.isNaN(parsed) || Double.isInfinite(parsed)) {
-                throw new JsonException("number out of range: " + literal);
-            }
-            return parsed;
-        } catch (NumberFormatException e) {
-            throw new JsonException("invalid number: " + literal);
+        double parsed = Double.parseDouble(literal);
+        if (Double.isNaN(parsed) || Double.isInfinite(parsed)) {
+            throw new JsonException("number out of range: " + literal);
         }
+        return parsed;
     }
 
-    private static boolean isNumberChar(char c) {
-        return (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-';
+    /** Consumes one or more ASCII digits. Returns false if there were none. */
+    private boolean readDigits() {
+        int start = pos;
+        while (pos < source.length() && source.charAt(pos) >= '0' && source.charAt(pos) <= '9') {
+            pos++;
+        }
+        return pos > start;
     }
 
     private void expect(String literal) {

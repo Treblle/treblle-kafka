@@ -1,13 +1,15 @@
 package com.treblle.kafka;
 
-import com.treblle.kafka.core.Capture;
-import com.treblle.kafka.transport.Dispatcher;
-import com.treblle.kafka.util.DebugLogger;
-import com.treblle.kafka.util.TopicFilter;
+import com.treblle.kafka.internal.core.Capture;
+import com.treblle.kafka.internal.transport.Dispatcher;
+import com.treblle.kafka.internal.util.DebugLogger;
+import com.treblle.kafka.internal.util.TopicFilter;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.kafka.clients.producer.Producer;
 
@@ -28,6 +30,9 @@ import org.apache.kafka.clients.producer.Producer;
  * TreblleConsumerTracker tracker = treblle.consumerTracker(consumerProps);
  * }</pre>
  *
+ * <p>Call {@link #close()} when your application shuts down; it sends anything still queued. As a
+ * safety net the SDK also registers a JVM shutdown hook that does the same if you forget.
+ *
  * <p>If the SDK is disabled or misconfigured, {@link #wrap} hands back the producer untouched and
  * {@link TreblleConsumerTracker} becomes a pass-through, so there is no overhead at all - not even
  * a branch per message beyond the wrapper itself.
@@ -37,32 +42,36 @@ public final class Treblle implements AutoCloseable {
     private final TreblleConfig config;
     private final DebugLogger logger;
     private final TopicFilter topicFilter;
+    /** How long {@link #close()} and the shutdown hook wait for queued payloads to be sent. */
+    public static final Duration DEFAULT_CLOSE_TIMEOUT = Duration.ofSeconds(5);
+
     private final Dispatcher dispatcher;
+    private final Thread shutdownHook;
+    private volatile boolean closed;
 
     private Treblle(TreblleConfig config) {
         this.config = config;
         this.logger = new DebugLogger(config.isDebug());
-        this.topicFilter = new TopicFilter(config.getExcludedTopics());
+        this.topicFilter = new TopicFilter(config.getIncludedTopics(), config.getExcludedTopics());
 
         logger.log("initialising Treblle Kafka SDK: " + config.describe());
 
         if (!config.isEnabled()) {
             logger.warn("SDK is disabled (enabled=false); no data will be sent");
             this.dispatcher = null;
+            this.shutdownHook = null;
             return;
         }
         if (!config.isValid()) {
             logger.warn("sdkToken and apiKey are both required; SDK disabled. "
                     + "Set them on the builder, or via TREBLLE_SDK_TOKEN / TREBLLE_API_KEY.");
             this.dispatcher = null;
+            this.shutdownHook = null;
             return;
-        }
-        if (config.getMaskedKeywords().isEmpty()) {
-            logger.warn("maskedKeywords is empty; masking is disabled and message bodies and "
-                    + "headers will be sent to Treblle as-is");
         }
 
         this.dispatcher = new Dispatcher(config, logger, kafkaClientVersion());
+        this.shutdownHook = registerShutdownHook();
         logger.log("Treblle Kafka SDK is active");
     }
 
@@ -128,20 +137,79 @@ public final class Treblle implements AutoCloseable {
         return new TreblleConsumerTracker(this, clientInfo(null));
     }
 
-    /** True when the SDK is enabled and correctly configured. */
+    /** True when the SDK is enabled, correctly configured and not closed. */
     public boolean isActive() {
-        return dispatcher != null;
+        return dispatcher != null && !closed;
     }
 
     public TreblleConfig getConfig() {
         return config;
     }
 
-    /** Stops the background worker threads. Wrapped producers keep working; they just stop reporting. */
+    /**
+     * Waits until every message captured so far has been sent to Treblle, or the timeout expires.
+     * Useful at the end of a batch job, or in tests. Never throws.
+     *
+     * @return true if everything was sent in time
+     */
+    public boolean flush(Duration timeout) {
+        if (dispatcher == null || timeout == null) {
+            return true;
+        }
+        return dispatcher.flush(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Sends anything still queued (waiting up to {@link #DEFAULT_CLOSE_TIMEOUT}), then stops the
+     * background threads. Wrapped producers keep working; they just stop reporting.
+     */
     @Override
     public void close() {
-        if (dispatcher != null) {
-            dispatcher.close();
+        close(DEFAULT_CLOSE_TIMEOUT);
+    }
+
+    /**
+     * Sends anything still queued (waiting up to {@code timeout}), then stops the background
+     * threads. Payloads still queued after the timeout are discarded. Idempotent.
+     */
+    public void close(Duration timeout) {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        if (dispatcher == null) {
+            return;
+        }
+        removeShutdownHook();
+        Duration wait = timeout == null ? DEFAULT_CLOSE_TIMEOUT : timeout;
+        dispatcher.close(wait.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    private Thread registerShutdownHook() {
+        Thread hook = new Thread(() -> {
+            if (!closed) {
+                closed = true;
+                dispatcher.close(DEFAULT_CLOSE_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS);
+            }
+        }, "treblle-kafka-shutdown");
+        try {
+            Runtime.getRuntime().addShutdownHook(hook);
+            return hook;
+        } catch (RuntimeException e) {
+            // Already shutting down, or a SecurityManager forbids hooks. Explicit close() still works.
+            logger.error("could not register shutdown hook", e);
+            return null;
+        }
+    }
+
+    private void removeShutdownHook() {
+        if (shutdownHook == null || Thread.currentThread() == shutdownHook) {
+            return;
+        }
+        try {
+            Runtime.getRuntime().removeShutdownHook(shutdownHook);
+        } catch (RuntimeException ignored) {
+            // IllegalStateException: the JVM is already shutting down and the hook will run.
         }
     }
 
@@ -152,11 +220,13 @@ public final class Treblle implements AutoCloseable {
     }
 
     boolean isTracking(String topic) {
-        if (dispatcher == null) {
+        if (dispatcher == null || closed) {
             return false;
         }
         if (topicFilter.isExcluded(topic)) {
-            logger.log("topic '" + topic + "' is excluded; skipping");
+            if (logger.isEnabled()) {
+                logger.log("topic '" + topic + "' is excluded; skipping");
+            }
             return false;
         }
         return true;
@@ -228,19 +298,41 @@ public final class Treblle implements AutoCloseable {
             return this;
         }
 
-        /** Keys whose values are masked before sending. Empty disables masking entirely. */
+        /**
+         * Extra keys whose values are masked before sending, on top of
+         * {@link TreblleConfig#DEFAULT_MASKED_KEYWORDS}. The defaults always apply.
+         */
         public Builder maskedKeywords(String... maskedKeywords) {
             config.maskedKeywords(maskedKeywords);
             return this;
         }
 
-        /** Keys whose values are masked before sending. Empty disables masking entirely. */
+        /** Extra keys whose values are masked. See the varargs overload. */
         public Builder maskedKeywords(List<String> maskedKeywords) {
             config.maskedKeywords(maskedKeywords);
             return this;
         }
 
-        /** Topics the SDK must not track. Supports exact names and {@code prefix.*} wildcards. */
+        /**
+         * Topics the SDK must track, to the exclusion of all others. Supports exact names and
+         * {@code prefix.*} wildcards. Empty (the default) means every topic is a candidate. See
+         * {@link #excludedTopics(String...)} for how the two combine.
+         */
+        public Builder includedTopics(String... includedTopics) {
+            config.includedTopics(includedTopics);
+            return this;
+        }
+
+        /** Topics the SDK must track, to the exclusion of all others. See the varargs overload. */
+        public Builder includedTopics(List<String> includedTopics) {
+            config.includedTopics(includedTopics);
+            return this;
+        }
+
+        /**
+         * Topics the SDK must not track. Supports exact names and {@code prefix.*} wildcards.
+         * Applied after {@code includedTopics}, and wins when a topic matches both.
+         */
         public Builder excludedTopics(String... excludedTopics) {
             config.excludedTopics(excludedTopics);
             return this;
@@ -249,6 +341,24 @@ public final class Treblle implements AutoCloseable {
         /** Topics the SDK must not track. Supports exact names and {@code prefix.*} wildcards. */
         public Builder excludedTopics(List<String> excludedTopics) {
             config.excludedTopics(excludedTopics);
+            return this;
+        }
+
+        /**
+         * Whether record keys are reported as {@code kafka.key} metadata. Defaults to true. Turn it
+         * off if your keys carry personal data such as email addresses.
+         */
+        public Builder captureRecordKeys(boolean captureRecordKeys) {
+            config.captureRecordKeys(captureRecordKeys);
+            return this;
+        }
+
+        /**
+         * Renders record values the SDK does not understand natively (typically POJOs) into JSON,
+         * e.g. {@code objectMapper::writeValueAsString}. See {@link ValueRenderer}.
+         */
+        public Builder valueRenderer(ValueRenderer valueRenderer) {
+            config.valueRenderer(valueRenderer);
             return this;
         }
 

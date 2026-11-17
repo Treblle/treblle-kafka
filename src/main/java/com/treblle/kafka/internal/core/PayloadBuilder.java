@@ -1,4 +1,4 @@
-package com.treblle.kafka.core;
+package com.treblle.kafka.internal.core;
 
 import com.treblle.kafka.TreblleConfig;
 
@@ -116,13 +116,17 @@ public final class PayloadBuilder {
 
     private Map<String, Object> buildRequest(Capture capture) {
         Map<String, Object> request = new LinkedHashMap<>();
-        request.put("timestamp", RuntimeInfo.formatTimestamp(capture.recordTimestampMillis));
+        // When the operation happened - not the record's own timestamp, which for a consumer can
+        // be hours old and would misplace the event on Treblle's timeline. The record timestamp
+        // is reported separately as the kafka-timestamp response header.
+        request.put("timestamp", RuntimeInfo.formatTimestamp(capture.operationTimestampMillis));
         request.put("ip", RuntimeInfo.serverIp());
         request.put("url", buildUrl(capture));
         request.put("user_agent", buildUserAgent(capture));
         request.put("method", capture.isProduce() ? "POST" : "GET");
         request.put("headers", masker.maskHeaders(nonNull(capture.headers)));
-        request.put("body", masker.maskBody(BodyNormalizer.normalize(capture.value)));
+        request.put("body", masker.maskBody(
+                BodyNormalizer.normalize(capture.value, config.getValueRenderer())));
         request.put("route_path", capture.topic);
         // Kafka has no query string. The field is required, so it is always an empty object.
         request.put("query", new LinkedHashMap<String, Object>());
@@ -154,6 +158,10 @@ public final class PayloadBuilder {
                         RuntimeInfo.formatTimestamp(capture.ackTimestampMillis));
             }
         } else {
+            if (capture.recordTimestampMillis > 0) {
+                headers.put("kafka-timestamp",
+                        RuntimeInfo.formatTimestamp(capture.recordTimestampMillis));
+            }
             if (isNotEmpty(capture.groupId)) {
                 headers.put("kafka-group-id", capture.groupId);
             }
@@ -168,9 +176,9 @@ public final class PayloadBuilder {
         if (capture.failure != null) {
             Throwable root = ErrorMapper.unwrap(capture.failure);
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("message", root.getMessage() == null
+            body.put("message", masker.maskText(root.getMessage() == null
                     ? root.getClass().getName()
-                    : root.getMessage());
+                    : root.getMessage()));
             return body;
         }
         if (capture.isProduce()) {
@@ -185,7 +193,7 @@ public final class PayloadBuilder {
             return receipt;
         }
         if (capture.hasHandlerResult) {
-            return BodyNormalizer.normalize(capture.handlerResult);
+            return BodyNormalizer.normalize(capture.handlerResult, config.getValueRenderer());
         }
         return new LinkedHashMap<String, Object>();
     }
@@ -196,7 +204,12 @@ public final class PayloadBuilder {
             String source = capture.isProduce()
                     ? ErrorMapper.SOURCE_ON_ERROR
                     : ErrorMapper.SOURCE_ON_EXCEPTION;
-            errors.add(ErrorMapper.toError(capture.failure, source));
+            Map<String, Object> error = ErrorMapper.toError(capture.failure, source);
+            Object message = error.get("message");
+            if (message instanceof String) {
+                error.put("message", masker.maskText((String) message));
+            }
+            errors.add(error);
         }
         return errors;
     }
@@ -215,7 +228,7 @@ public final class PayloadBuilder {
         if (capture.offset >= 0) {
             put(metadata, "kafka.offset", capture.offset);
         }
-        put(metadata, "kafka.key", capture.key);
+        put(metadata, "kafka.key", masker.maskText(capture.key));
         put(metadata, "kafka.client.id", capture.clientId);
         put(metadata, "kafka.group.id", capture.groupId);
         put(metadata, "kafka.timestamp.type", capture.timestampType);
@@ -226,7 +239,7 @@ public final class PayloadBuilder {
             }
             put(metadata, entry.getKey(), entry.getValue());
         }
-        return metadata;
+        return masker.maskMetadata(metadata);
     }
 
     private static void put(Map<String, Object> metadata, String key, Object value) {

@@ -1,6 +1,6 @@
-package com.treblle.kafka.core;
+package com.treblle.kafka.internal.core;
 
-import com.treblle.kafka.util.DebugLogger;
+import com.treblle.kafka.internal.util.DebugLogger;
 
 import java.util.ArrayList;
 import java.util.Arrays;

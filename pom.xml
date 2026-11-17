@@ -15,7 +15,7 @@
         Treblle SDK for Apache Kafka. Captures produced and consumed messages, masks sensitive
         values, and ships them to Treblle Ingress without impacting the host application.
     </description>
-    <url>https://treblle.com</url>
+    <url>https://github.com/Treblle/treblle-kafka</url>
 
     <licenses>
         <license>
@@ -25,11 +25,37 @@
         </license>
     </licenses>
 
+    <developers>
+        <developer>
+            <id>cindreta</id>
+            <name>Vedran Cindric</name>
+            <email>vedran@treblle.com</email>
+            <organization>Treblle</organization>
+            <organizationUrl>https://treblle.com</organizationUrl>
+        </developer>
+    </developers>
+
+    <scm>
+        <url>https://github.com/Treblle/treblle-kafka</url>
+        <connection>scm:git:https://github.com/Treblle/treblle-kafka.git</connection>
+        <developerConnection>scm:git:git@github.com:Treblle/treblle-kafka.git</developerConnection>
+        <tag>HEAD</tag>
+    </scm>
+
+    <issueManagement>
+        <system>GitHub</system>
+        <url>https://github.com/Treblle/treblle-kafka/issues</url>
+    </issueManagement>
+
     <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
+        <maven.compiler.release>11</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!--
+            The version compiled and tested against. CI overrides it (-Dkafka.version=...) to
+            build and test the same sources against the oldest and newest supported clients.
+        -->
         <kafka.version>3.9.0</kafka.version>
+        <junit.version>5.11.4</junit.version>
     </properties>
 
     <dependencies>
@@ -43,6 +69,13 @@
             <artifactId>kafka-clients</artifactId>
             <version>${kafka.version}</version>
             <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
@@ -58,6 +91,23 @@
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Automatic-Module-Name>com.treblle.kafka</Automatic-Module-Name>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-source-plugin</artifactId>
                 <version>3.3.1</version>
                 <executions>
@@ -69,7 +119,73 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <version>3.11.2</version>
+                <configuration>
+                    <excludePackageNames>com.treblle.kafka.internal.*</excludePackageNames>
+                    <doclint>all,-missing</doclint>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>attach-javadocs</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Release profile used by the GitHub Actions release workflow: mvn -B clean deploy -Pci-cd.
+             Publishes to Maven Central via the Central Publisher Portal (OSSRH was retired 2025-06-30).
+             Sources and javadoc jars are built by the default build above, so CI checks them too. -->
+        <profile>
+            <id>ci-cd</id>
+            <distributionManagement>
+                <repository>
+                    <id>central</id>
+                    <url>https://central.sonatype.com/api/v1/publisher/upload</url>
+                </repository>
+            </distributionManagement>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.7</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.6.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
 </project>
