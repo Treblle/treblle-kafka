@@ -97,10 +97,11 @@ class TreblleConsumerTrackerTest {
         tracker.track(record("orders.created", 1L), r -> TreblleContext.put("tenant", "acme"));
         tracker.track(record("orders.created", 1L), r -> { });
 
-        List<Map<String, Object>> payloads = payloads(2);
-        assertEquals("acme", path(payloads.get(0), "data", "metadata", "tenant"));
-        Map<String, Object> second = path(payloads.get(1), "data", "metadata");
-        assertFalse(second.containsKey("tenant"));
+        // Payloads are sent concurrently, so they may arrive in either order.
+        long tagged = payloads(2).stream()
+                .filter(p -> "acme".equals(path(p, "data", "metadata", "tenant")))
+                .count();
+        assertEquals(1, tagged, "exactly the first record carries the metadata");
     }
 
     @Test

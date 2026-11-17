@@ -37,12 +37,16 @@ class DispatcherTest {
     }
 
     private Dispatcher dispatcher() {
+        return dispatcher(true);
+    }
+
+    private Dispatcher dispatcher(boolean startWorker) {
         TreblleConfig config = TreblleConfig.builder()
                 .sdkToken("token-123")
                 .apiKey("key-456")
                 .ingressEndpoint(ingress.url())
                 .build();
-        dispatcher = new Dispatcher(config, new DebugLogger(false), "3.9.0");
+        dispatcher = new Dispatcher(config, new DebugLogger(false), "3.9.0", startWorker);
         return dispatcher;
     }
 
@@ -90,20 +94,27 @@ class DispatcherTest {
 
     @Test
     void enforcesMemoryBudget() {
-        ingress.delay(2_000);
-        Dispatcher d = dispatcher();
+        // No worker: nothing drains the queue, so the outcome does not depend on timing.
+        Dispatcher d = dispatcher(false);
         Capture big = capture("orders");
         big.estimatedBytes = Dispatcher.MAX_QUEUED_BYTES - 10;
+        Capture small = capture("orders");
+        small.estimatedBytes = 10;
         Capture next = capture("orders");
         next.estimatedBytes = 100;
 
-        // The first may be picked up by the worker at once; keep submitting until the budget bites.
-        boolean rejected = false;
-        for (int i = 0; i < 20 && !rejected; i++) {
-            d.submit(big);
-            rejected = !d.submit(next);
+        assertTrue(d.submit(big));
+        assertTrue(d.submit(small), "exactly at the budget is still accepted");
+        assertFalse(d.submit(next), "the queue must refuse captures over its memory budget");
+    }
+
+    @Test
+    void dropsOldestWhenQueueIsFull() {
+        Dispatcher d = dispatcher(false);
+        for (int i = 0; i < Dispatcher.QUEUE_CAPACITY; i++) {
+            assertTrue(d.submit(capture("orders")));
         }
-        assertTrue(rejected, "the queue must refuse captures over its memory budget");
+        assertTrue(d.submit(capture("orders")), "a full queue makes room by dropping the oldest");
     }
 
     @Test

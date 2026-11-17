@@ -57,6 +57,12 @@ public final class Dispatcher {
     private final ExecutorService httpExecutor;
 
     public Dispatcher(TreblleConfig config, DebugLogger logger, String kafkaClientVersion) {
+        this(config, logger, kafkaClientVersion, true);
+    }
+
+    /** {@code startWorker = false} leaves the queue undrained, so tests can inspect it. */
+    Dispatcher(TreblleConfig config, DebugLogger logger, String kafkaClientVersion,
+            boolean startWorker) {
         this.logger = logger;
         this.breaker = new CircuitBreaker(logger);
         this.payloadBuilder = new PayloadBuilder(
@@ -65,7 +71,9 @@ public final class Dispatcher {
         this.httpExecutor = Executors.newFixedThreadPool(2, daemonThreads("treblle-kafka-http"));
         this.ingress = new IngressClient(config, logger, breaker, (Executor) httpExecutor);
         this.worker = Executors.newSingleThreadExecutor(daemonThreads("treblle-kafka-dispatcher"));
-        this.worker.submit(this::drain);
+        if (startWorker) {
+            this.worker.submit(this::drain);
+        }
     }
 
     /**
