@@ -54,7 +54,7 @@
             The version compiled and tested against. CI overrides it (-Dkafka.version=...) to
             build and test the same sources against the oldest and newest supported clients.
         -->
-        <kafka.version>3.9.0</kafka.version>
+        <kafka.version>3.9.2</kafka.version>
         <junit.version>5.11.4</junit.version>
     </properties>
 
